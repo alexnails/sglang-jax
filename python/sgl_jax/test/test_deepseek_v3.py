@@ -36,6 +36,20 @@ mesh = create_device_mesh(
 )
 jax.sharding.set_mesh(mesh)
 
+TEST_NUM_HEADS = 2
+TEST_Q_LORA_RANK = 8
+TEST_KV_LORA_RANK = 4
+TEST_QK_NOPE_HEAD_DIM = 128
+TEST_QK_ROPE_HEAD_DIM = 4
+TEST_V_HEAD_DIM = 128
+TEST_HEAD_DIM = TEST_QK_NOPE_HEAD_DIM + TEST_QK_ROPE_HEAD_DIM
+
+
+def make_bf16_tensor(shape, start: int = 0, scale: float = 0.01):
+    size = int(np.prod(shape))
+    values = np.arange(start, start + size, dtype=np.float32).reshape(shape) * scale
+    return jnp.asarray(values, dtype=jnp.bfloat16)
+
 
 def tiny_deepseek_config_dict(**overrides):
     config = {
@@ -46,19 +60,19 @@ def tiny_deepseek_config_dict(**overrides):
         "intermediate_size": 32,
         "moe_intermediate_size": 8,
         "num_hidden_layers": 1,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 2,
+        "num_attention_heads": TEST_NUM_HEADS,
+        "num_key_value_heads": TEST_NUM_HEADS,
         "max_position_embeddings": 32,
         "rope_theta": 10000.0,
         "rms_norm_eps": 1e-6,
         "hidden_act": "silu",
         "attention_bias": False,
         "tie_word_embeddings": False,
-        "q_lora_rank": 8,
-        "kv_lora_rank": 4,
-        "qk_nope_head_dim": 4,
-        "qk_rope_head_dim": 4,
-        "v_head_dim": 4,
+        "q_lora_rank": TEST_Q_LORA_RANK,
+        "kv_lora_rank": TEST_KV_LORA_RANK,
+        "qk_nope_head_dim": TEST_QK_NOPE_HEAD_DIM,
+        "qk_rope_head_dim": TEST_QK_ROPE_HEAD_DIM,
+        "v_head_dim": TEST_V_HEAD_DIM,
         "n_routed_experts": 4,
         "n_shared_experts": 1,
         "num_experts_per_tok": 2,
@@ -191,10 +205,10 @@ class TestDeepseekV3(unittest.TestCase):
             model_config = ModelConfig(tmpdir, trust_remote_code=False)
 
             self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
-            self.assertEqual(model_config.head_dim, 8)
-            self.assertEqual(model_config.v_head_dim, 4)
-            self.assertEqual(model_config.kv_lora_rank, 4)
-            self.assertEqual(model_config.q_lora_rank, 8)
+            self.assertEqual(model_config.head_dim, TEST_HEAD_DIM)
+            self.assertEqual(model_config.v_head_dim, TEST_V_HEAD_DIM)
+            self.assertEqual(model_config.kv_lora_rank, TEST_KV_LORA_RANK)
+            self.assertEqual(model_config.q_lora_rank, TEST_Q_LORA_RANK)
             self.assertEqual(model_config.num_experts, 4)
             self.assertEqual(model_config.hf_config.moe_backend, "fused")
             model_cls, arch = ModelRegistry.resolve_model_cls(model_config.hf_config.architectures)
@@ -206,17 +220,17 @@ class TestDeepseekV3(unittest.TestCase):
             size=8,
             page_size=1,
             dtype=jnp.bfloat16,
-            head_num=2,
-            qk_nope_head_dim=4,
-            qk_rope_head_dim=4,
-            v_head_dim=4,
+            head_num=TEST_NUM_HEADS,
+            qk_nope_head_dim=TEST_QK_NOPE_HEAD_DIM,
+            qk_rope_head_dim=TEST_QK_ROPE_HEAD_DIM,
+            v_head_dim=TEST_V_HEAD_DIM,
             layer_num=1,
             mesh=mesh,
         )
         loc = jnp.array([1, 3], dtype=jnp.int32)
-        k_nope = jnp.arange(2 * 2 * 4, dtype=jnp.float32).reshape(2, 2, 4).astype(jnp.bfloat16)
-        k_pe = jnp.arange(2 * 1 * 4, dtype=jnp.float32).reshape(2, 1, 4).astype(jnp.bfloat16)
-        v = (k_nope + 100).astype(jnp.bfloat16)
+        k_nope = make_bf16_tensor((2, TEST_NUM_HEADS, TEST_QK_NOPE_HEAD_DIM), start=0)
+        k_pe = make_bf16_tensor((2, 1, TEST_QK_ROPE_HEAD_DIM), start=1000)
+        v = make_bf16_tensor((2, TEST_NUM_HEADS, TEST_V_HEAD_DIM), start=2000)
 
         pool.set_mla_kv_buffer(0, loc, k_nope, k_pe, v)
 
@@ -235,69 +249,45 @@ class TestDeepseekV3(unittest.TestCase):
 
     def test_flash_mla_backend_matches_reference_kernel(self):
         backend = FlashAttention(
-            num_attn_heads=2,
-            num_kv_heads=2,
-            head_dim=8,
+            num_attn_heads=TEST_NUM_HEADS,
+            num_kv_heads=TEST_NUM_HEADS,
+            head_dim=TEST_HEAD_DIM,
             page_size=1,
             mesh=mesh,
-            v_head_dim=4,
+            v_head_dim=TEST_V_HEAD_DIM,
         )
         _, forward_batch = make_decode_batches(backend, seq_len=3)
         pool = MLATokenToKVPool(
             size=8,
             page_size=1,
             dtype=jnp.bfloat16,
-            head_num=2,
-            qk_nope_head_dim=4,
-            qk_rope_head_dim=4,
-            v_head_dim=4,
+            head_num=TEST_NUM_HEADS,
+            qk_nope_head_dim=TEST_QK_NOPE_HEAD_DIM,
+            qk_rope_head_dim=TEST_QK_ROPE_HEAD_DIM,
+            v_head_dim=TEST_V_HEAD_DIM,
             layer_num=1,
             mesh=mesh,
         )
 
-        prefix_k_nope = jnp.array(
-            [
-                [[1.0, 0.0, 0.0, 0.0], [0.5, 0.0, 0.0, 0.0]],
-                [[0.0, 1.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0]],
-            ],
-            dtype=jnp.bfloat16,
-        )
-        prefix_k_pe = jnp.array(
-            [[[0.2, 0.0, 0.0, 0.0]], [[0.0, 0.2, 0.0, 0.0]]],
-            dtype=jnp.bfloat16,
-        )
-        prefix_v = jnp.array(
-            [
-                [[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]],
-                [[2.0, 1.0, 0.0, 1.0], [1.0, 0.0, 1.0, 2.0]],
-            ],
-            dtype=jnp.bfloat16,
-        )
+        prefix_k_nope = make_bf16_tensor((2, TEST_NUM_HEADS, TEST_QK_NOPE_HEAD_DIM), start=10)
+        prefix_k_pe = make_bf16_tensor((2, 1, TEST_QK_ROPE_HEAD_DIM), start=2000)
+        prefix_v = make_bf16_tensor((2, TEST_NUM_HEADS, TEST_V_HEAD_DIM), start=4000)
         pool.k_nope_buffer[0] = pool.k_nope_buffer[0].at[jnp.array([0, 1])].set(prefix_k_nope)
         pool.k_pe_buffer[0] = pool.k_pe_buffer[0].at[jnp.array([0, 1])].set(prefix_k_pe)
         pool.v_buffer[0] = pool.v_buffer[0].at[jnp.array([0, 1])].set(prefix_v)
 
-        q = jnp.array(
-            [[[0.3, 0.4, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0], [0.4, 0.3, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0]]],
-            dtype=jnp.bfloat16,
-        )
-        k_nope = jnp.array(
-            [[[0.4, 0.2, 0.0, 0.0], [0.2, 0.4, 0.0, 0.0]]],
-            dtype=jnp.bfloat16,
-        )
-        k_pe = jnp.array([[[0.1, 0.1, 0.0, 0.0]]], dtype=jnp.bfloat16)
-        v = jnp.array(
-            [[[3.0, 2.0, 1.0, 0.0], [0.0, 1.0, 2.0, 3.0]]],
-            dtype=jnp.bfloat16,
-        )
+        q = make_bf16_tensor((1, TEST_NUM_HEADS, TEST_HEAD_DIM), start=6000)
+        k_nope = make_bf16_tensor((1, TEST_NUM_HEADS, TEST_QK_NOPE_HEAD_DIM), start=7000)
+        k_pe = make_bf16_tensor((1, 1, TEST_QK_ROPE_HEAD_DIM), start=8000)
+        v = make_bf16_tensor((1, TEST_NUM_HEADS, TEST_V_HEAD_DIM), start=9000)
 
         layer = RadixAttention(
-            num_heads=2,
-            head_dim=8,
-            scaling=8**-0.5,
-            num_kv_heads=2,
+            num_heads=TEST_NUM_HEADS,
+            head_dim=TEST_HEAD_DIM,
+            scaling=TEST_HEAD_DIM**-0.5,
+            num_kv_heads=TEST_NUM_HEADS,
             layer_id=0,
-            v_head_dim=4,
+            v_head_dim=TEST_V_HEAD_DIM,
         )
 
         expected_k = jnp.concatenate(
@@ -477,10 +467,10 @@ class TestDeepseekV3(unittest.TestCase):
             size=8,
             page_size=1,
             dtype=jnp.bfloat16,
-            head_num=2,
-            qk_nope_head_dim=4,
-            qk_rope_head_dim=4,
-            v_head_dim=4,
+            head_num=TEST_NUM_HEADS,
+            qk_nope_head_dim=TEST_QK_NOPE_HEAD_DIM,
+            qk_rope_head_dim=TEST_QK_ROPE_HEAD_DIM,
+            v_head_dim=TEST_V_HEAD_DIM,
             layer_num=1,
             mesh=mesh,
         )

@@ -172,9 +172,14 @@ class ModelConfig:
         self.qk_rope_head_dim = getattr(self.hf_text_config, "qk_rope_head_dim", None)
         self.qk_nope_head_dim = getattr(self.hf_text_config, "qk_nope_head_dim", None)
         derived_head_dim = self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads
-        if self.qk_nope_head_dim is not None and self.qk_rope_head_dim is not None:
+        has_mla_head_dims = self.qk_nope_head_dim is not None and self.qk_rope_head_dim is not None
+        if has_mla_head_dims:
             derived_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        self.head_dim = getattr(self.hf_text_config, "head_dim", derived_head_dim)
+        self.head_dim = (
+            derived_head_dim
+            if has_mla_head_dims
+            else getattr(self.hf_text_config, "head_dim", derived_head_dim)
+        )
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", self.head_dim)
 
         self.attention_arch = self._resolve_attention_arch()
