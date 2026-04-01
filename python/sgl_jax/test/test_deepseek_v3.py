@@ -25,7 +25,15 @@ from sgl_jax.srt.models.deepseek_v3 import (
 from sgl_jax.srt.models.registry import ModelRegistry
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
-mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+# Keep these focused unit tests on a single device even when running on
+# multi-chip TPU pods. The toy configs intentionally use tiny head counts
+# (e.g. 2 heads), so sharding over the full tensor mesh would introduce
+# divisibility constraints unrelated to the DeepSeek/MLA behavior under test.
+mesh = create_device_mesh(
+    ici_parallelism=[1, -1],
+    dcn_parallelism=[1, 1],
+    devices=[jax.devices()[0]],
+)
 jax.sharding.set_mesh(mesh)
 
 
