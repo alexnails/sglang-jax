@@ -6,7 +6,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MLATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -55,6 +55,7 @@ class NativeAttention(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        **kwargs,
     ):
         """
         Args:
@@ -64,6 +65,17 @@ class NativeAttention(AttentionBackend):
         Returns:
             Tuple of (output tensor of shape [total_tokens, hidden_size], k, v)
         """
+        if isinstance(token_to_kv_pool, MLATokenToKVPool) or getattr(token_to_kv_pool, "is_mla", False):
+            return self._call_mla(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                token_to_kv_pool,
+                **kwargs,
+            )
+
         # TODO(pc) support tree based native attention backend
         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
             k, v, forward_batch, token_to_kv_pool, self.kv_sharding, layer.layer_id
@@ -99,6 +111,56 @@ class NativeAttention(AttentionBackend):
         )
 
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
+        return attn_output, kv_fused
+
+    def _call_mla(
+        self,
+        q: jax.Array,
+        k_nope: jax.Array,
+        v: jax.Array,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        *,
+        k_pe: jax.Array,
+        **kwargs,
+    ):
+        del kwargs
+        k_buffer, v_buffer, kv_fused = self._get_and_update_mla_kv_cache(
+            k_nope,
+            k_pe,
+            v,
+            forward_batch,
+            token_to_kv_pool,
+            layer.layer_id,
+        )
+
+        scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
+
+        is_causal = True
+        if (
+            forward_batch.forward_mode == ForwardMode.DECODE
+            or layer.attn_type == AttentionType.ENCODER_ONLY
+        ):
+            is_causal = False
+
+        xai_temp_len = getattr(layer, "xai_temperature_len", None)
+        attn_output = forward_attention(
+            q,
+            k_buffer,
+            v_buffer,
+            forward_batch.seq_lens,
+            forward_batch.cache_loc,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_seq_lens,
+            layer.q_head_num,
+            layer.kv_head_num,
+            scale,
+            is_causal,
+            forward_batch.forward_mode,
+            self.kv_sharding,
+            xai_temperature_len=xai_temp_len,
+        )
         return attn_output, kv_fused
 
     def _get_and_update_kv_cache(
@@ -138,6 +200,48 @@ class NativeAttention(AttentionBackend):
             # Return fused buffer directly for persistence outside JIT
             fused_return = updated_layer
         return k, v, fused_return
+
+    def _get_and_update_mla_kv_cache(
+        self,
+        k_nope: jax.Array,
+        k_pe: jax.Array,
+        v: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        layer_id: int,
+    ) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array, jax.Array]]:
+        if forward_batch.forward_mode.is_extend():
+            token_to_kv_pool.set_mla_kv_buffer(
+                layer_id,
+                forward_batch.out_cache_loc,
+                k_nope,
+                k_pe,
+                v,
+                is_decode=False,
+            )
+        else:
+            token_to_kv_pool.set_mla_kv_buffer(
+                layer_id,
+                forward_batch.out_cache_loc,
+                k_nope,
+                k_pe,
+                v,
+                is_decode=True,
+            )
+
+        k_nope_buffer, k_pe_buffer, v_buffer = token_to_kv_pool.get_mla_kv_buffer(layer_id)
+        broadcast_k_pe = jax.device_put(
+            jnp.broadcast_to(k_pe_buffer, k_nope_buffer.shape[:-1] + (k_pe_buffer.shape[-1],)),
+            k_nope_buffer.sharding,
+        )
+        k_buffer = jnp.concatenate(
+            [
+                k_nope_buffer,
+                broadcast_k_pe,
+            ],
+            axis=-1,
+        )
+        return k_buffer, v_buffer, (k_nope_buffer, k_pe_buffer, v_buffer)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
@@ -216,6 +320,7 @@ def forward_attention(
         # [total_prefix_len, num_kv_heads, head_dim] -> [total_prefix_len, num_heads, head_dim]
         k_heads = jnp.repeat(k_heads, num_copies, axis=1, out_sharding=kv_sharding)
         v_heads = jnp.repeat(v_heads, num_copies, axis=1, out_sharding=kv_sharding)
+    output_hidden_size = num_heads * v_heads.shape[-1]
 
     # Transpose for matmul: [num_heads, num_tokens, head_dim]
     q_t = jnp.transpose(q_heads, (1, 0, 2))
@@ -266,7 +371,7 @@ def forward_attention(
 
     attn_output = jnp.matmul(attn_weights, v_t)
     attn_output = jnp.transpose(attn_output, (1, 0, 2))
-    return attn_output.reshape(num_tokens, hidden_size)
+    return attn_output.reshape(num_tokens, output_hidden_size)
 
 
 def _apply_extend_mask(

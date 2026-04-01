@@ -15,7 +15,7 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention import (
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import KVCache, SplitMHATokenToKVPool
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MLATokenToKVPool, SplitMHATokenToKVPool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
@@ -435,6 +435,7 @@ class FlashAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         causal: int = 1,
+        **kwargs,
     ):
         """
         Args:
@@ -447,12 +448,157 @@ class FlashAttention(AttentionBackend):
         """
         # Split path: SplitMHATokenToKVPool directly, or SWAKVPool wrapping
         # split sub-pools (e.g. hybrid models with different K/V head dims).
-        if isinstance(token_to_kv_pool, SplitMHATokenToKVPool) or getattr(
+        if isinstance(token_to_kv_pool, MLATokenToKVPool) or getattr(token_to_kv_pool, "is_mla", False):
+            return self._call_mla(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                token_to_kv_pool,
+                causal,
+                **kwargs,
+            )
+        elif isinstance(token_to_kv_pool, SplitMHATokenToKVPool) or getattr(
             token_to_kv_pool, "is_split", False
         ):
             return self._call_split(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
         else:
             return self._call_fused(q, k, v, layer, forward_batch, token_to_kv_pool, causal)
+
+    @named_scope
+    def _call_mla(
+        self,
+        q: jax.Array,
+        k_nope: jax.Array,
+        v: jax.Array,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        causal: int = 1,
+        *,
+        k_pe: jax.Array,
+        **kwargs,
+    ):
+        """MLA cache path: store `k_nope`, shared `k_pe`, and `v` separately."""
+        del kwargs
+        k_nope_cache, k_pe_cache, v_cache = token_to_kv_pool.get_mla_kv_buffer(layer.layer_id)
+
+        qk_nope_head_dim = k_nope.shape[-1]
+        qk_rope_head_dim = k_pe.shape[-1]
+        broadcast_k_pe = jax.device_put(
+            jnp.broadcast_to(k_pe, k_nope.shape[:-1] + (qk_rope_head_dim,)),
+            k_nope.sharding,
+        )
+        k = jnp.concatenate(
+            [
+                k_nope,
+                broadcast_k_pe,
+            ],
+            axis=-1,
+        )
+        broadcast_k_pe_cache = jax.device_put(
+            jnp.broadcast_to(k_pe_cache, k_nope_cache.shape[:-1] + (qk_rope_head_dim,)),
+            k_nope_cache.sharding,
+        )
+        k_cache = jnp.concatenate(
+            [
+                k_nope_cache,
+                broadcast_k_pe_cache,
+            ],
+            axis=-1,
+        )
+
+        scale = (
+            1.0 / jnp.sqrt(layer.head_dim)
+            if (layer is None or layer.scaling is None)
+            else layer.scaling
+        )
+
+        total_tokens_k = k_cache.shape[0]
+        num_pages = total_tokens_k // self.page_size
+        k_head_dim = k_cache.shape[-1]
+        v_head_dim_cache = v_cache.shape[-1]
+        k_cache_paged = k_cache.reshape(num_pages, self.page_size, -1, k_head_dim)
+        v_cache_paged = v_cache.reshape(num_pages, self.page_size, -1, v_head_dim_cache)
+
+        if self.forward_metadata.custom_mask is not None:
+            causal = 0
+
+        page_indices_arg = self.forward_metadata.page_indices
+        if hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
+            page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
+
+        kv_part = self.kv_partition_axis
+        in_specs = (
+            P(None, kv_part),
+            P(None, kv_part),
+            P(None, kv_part),
+            P(None, None, kv_part, None),
+            P(None, None, kv_part, None),
+            P(),
+            P(),
+            P(),
+            P(),
+            P(),
+            P(),
+        )
+        out_specs = (
+            P(None, kv_part),
+            P(None, kv_part, None),
+            P(None, kv_part, None),
+        )
+
+        def _ragged_paged_attention_with_mla_kv(*args):
+            queries, keys_new, values_new, k_cache_arg, v_cache_arg = args[:5]
+            other_args = args[5:]
+
+            result, updated_k, updated_v = ragged_paged_attention(
+                queries,
+                keys_new,
+                values_new,
+                None,
+                *other_args,
+                k_cache=k_cache_arg,
+                v_cache=v_cache_arg,
+                causal=causal,
+                sm_scale=scale,
+                sliding_window=layer.sliding_window_size,
+                soft_cap=layer.logit_cap,
+                xai_temperature_len=(
+                    layer.xai_temperature_len if layer.xai_temperature_len > 0 else None
+                ),
+                vmem_limit_bytes=self.vmem_limit_bytes,
+            )
+
+            return result, updated_k, updated_v
+
+        attn_output, updated_k, updated_v = jax.shard_map(
+            _ragged_paged_attention_with_mla_kv,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=False,
+        )(
+            q.reshape(q.shape[0], -1, self.head_dim),
+            k.reshape(k.shape[0], -1, k.shape[-1]),
+            v.reshape(v.shape[0], -1, v.shape[-1]),
+            k_cache_paged,
+            v_cache_paged,
+            self.forward_metadata.seq_lens,
+            page_indices_arg,
+            self.forward_metadata.cu_q_lens,
+            self.forward_metadata.cu_kv_lens,
+            self.forward_metadata.distribution,
+            self.forward_metadata.custom_mask,
+        )
+
+        updated_k_nope = updated_k[..., :qk_nope_head_dim]
+        updated_k_pe = updated_k[..., qk_nope_head_dim:][:, :1, :]
+
+        return (
+            attn_output.reshape(q.shape[0], -1),
+            (updated_k_nope, updated_k_pe, updated_v),
+        )
 
     @named_scope
     def _call_fused(

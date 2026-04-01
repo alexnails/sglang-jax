@@ -36,6 +36,7 @@ from sgl_jax.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sgl_jax.srt.mem_cache.memory_pool import (
+    MLATokenToKVPool,
     MHATokenToKVPool,
     ReqToTokenPool,
     SplitMHATokenToKVPool,
@@ -374,6 +375,30 @@ class ModelRunner(BaseModelRunner):
         if available_kv_cache_bytes <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
+        if self.model_config.attention_arch == AttentionArch.MLA:
+            num_heads_per_device = self.model_config.num_attention_heads // self.tp_size
+            qk_nope_head_dim = getattr(self.model_config, "qk_nope_head_dim", self.model_config.head_dim)
+            qk_rope_head_dim = getattr(self.model_config, "qk_rope_head_dim", 0)
+            v_head_dim = getattr(self.model_config, "v_head_dim", self.model_config.head_dim)
+            per_token_dim = (
+                num_heads_per_device * (qk_nope_head_dim + v_head_dim) + qk_rope_head_dim
+            )
+            cell_size = (
+                per_token_dim
+                * self.model_config.num_hidden_layers
+                * jnp.dtype(self.kv_cache_dtype).itemsize
+            )
+            max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
+            logger.info(
+                "TPU Memory profiling (MLA): available_device_memory=%.1fGB, "
+                "available_kv_cache=%.1fGB, max_tokens=%d, cell_size=%dbytes",
+                available_device_memory / (1024**3),
+                available_kv_cache_bytes / (1024**3),
+                max_tokens,
+                cell_size,
+            )
+            return max_tokens
+
         # head_dim/v_head_dim handling
         head_dim = self.model_config.head_dim
         v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
@@ -533,23 +558,44 @@ class ModelRunner(BaseModelRunner):
                 mesh=self.mesh,
             )
         else:
-            head_dim = self.model_config.head_dim
-            v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
+            if self.model_config.attention_arch == AttentionArch.MLA:
+                self.token_to_kv_pool = MLATokenToKVPool(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.num_attention_heads,
+                    qk_nope_head_dim=getattr(
+                        self.model_config,
+                        "qk_nope_head_dim",
+                        self.model_config.head_dim,
+                    ),
+                    qk_rope_head_dim=getattr(self.model_config, "qk_rope_head_dim", 0),
+                    v_head_dim=getattr(
+                        self.model_config,
+                        "v_head_dim",
+                        self.model_config.head_dim,
+                    ),
+                    layer_num=self.model_config.num_hidden_layers,
+                    mesh=self.mesh,
+                )
+            else:
+                head_dim = self.model_config.head_dim
+                v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
 
-            aligned_head_dim = (head_dim + 127) // 128 * 128
-            aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
+                aligned_head_dim = (head_dim + 127) // 128 * 128
+                aligned_v_head_dim = (v_head_dim + 127) // 128 * 128
 
-            pool_class = SplitMHATokenToKVPool if head_dim != v_head_dim else MHATokenToKVPool
-            self.token_to_kv_pool = pool_class(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=aligned_head_dim,
-                layer_num=self.model_config.num_hidden_layers,
-                mesh=self.mesh,
-                v_head_dim=aligned_v_head_dim,
-            )
+                pool_class = SplitMHATokenToKVPool if head_dim != v_head_dim else MHATokenToKVPool
+                self.token_to_kv_pool = pool_class(
+                    size=self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
+                    head_dim=aligned_head_dim,
+                    layer_num=self.model_config.num_hidden_layers,
+                    mesh=self.mesh,
+                    v_head_dim=aligned_v_head_dim,
+                )
 
         # Create KV pool allocator
         if self.token_to_kv_pool_allocator is None:
@@ -660,10 +706,22 @@ class ModelRunner(BaseModelRunner):
                 self.token_to_kv_pool.mesh,
                 P(None, self.token_to_kv_pool.kv_partition_axis, None),
             )
+            is_mla = isinstance(self.token_to_kv_pool, MLATokenToKVPool) or getattr(
+                self.token_to_kv_pool, "is_mla", False
+            )
             is_split = isinstance(self.token_to_kv_pool, SplitMHATokenToKVPool) or getattr(
                 self.token_to_kv_pool, "is_split", False
             )
-            if is_split:
+            if is_mla:
+                layers_kv_fused = [
+                    (
+                        jax.device_put(k_nope, target_sharding),
+                        jax.device_put(k_pe, NamedSharding(self.token_to_kv_pool.mesh, P(None, None, None))),
+                        jax.device_put(v, target_sharding),
+                    )
+                    for k_nope, k_pe, v in layers_kv_fused
+                ]
+            elif is_split:
                 layers_kv_fused = [
                     (jax.device_put(k, target_sharding), jax.device_put(v, target_sharding))
                     for k, v in layers_kv_fused

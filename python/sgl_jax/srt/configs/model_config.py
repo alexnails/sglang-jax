@@ -167,13 +167,17 @@ class ModelConfig:
             self.context_len = derived_context_len
 
         # Unify the config keys for hf_text_config
-        self.head_dim = getattr(
-            self.hf_text_config,
-            "head_dim",
-            self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
-        )
+        self.q_lora_rank = getattr(self.hf_text_config, "q_lora_rank", None)
+        self.kv_lora_rank = getattr(self.hf_text_config, "kv_lora_rank", None)
+        self.qk_rope_head_dim = getattr(self.hf_text_config, "qk_rope_head_dim", None)
+        self.qk_nope_head_dim = getattr(self.hf_text_config, "qk_nope_head_dim", None)
+        derived_head_dim = self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads
+        if self.qk_nope_head_dim is not None and self.qk_rope_head_dim is not None:
+            derived_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.head_dim = getattr(self.hf_text_config, "head_dim", derived_head_dim)
+        self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", self.head_dim)
 
-        self.attention_arch = AttentionArch.MHA
+        self.attention_arch = self._resolve_attention_arch()
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(self.hf_text_config, "num_key_value_heads", None)
 
@@ -183,6 +187,16 @@ class ModelConfig:
 
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
+        self.num_experts = getattr(
+            self.hf_text_config,
+            "num_experts",
+            getattr(self.hf_text_config, "n_routed_experts", 0),
+        )
+        if not hasattr(self.hf_config, "num_experts"):
+            self.hf_config.num_experts = self.num_experts
+        self.hf_config.moe_backend = (
+            self.moe_backend.value if isinstance(self.moe_backend, MoEBackend) else self.moe_backend
+        )
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
@@ -212,6 +226,17 @@ class ModelConfig:
         self.image_token_id = getattr(config, "image_token_id", None) or getattr(
             config, "image_token_index", None
         )
+
+    def _resolve_attention_arch(self) -> AttentionArch:
+        if self._is_mla_model():
+            return AttentionArch.MLA
+        return AttentionArch.MHA
+
+    def _is_mla_model(self) -> bool:
+        architecture_names = getattr(self.hf_config, "architectures", []) or []
+        if any(arch.startswith("DeepseekV3") for arch in architecture_names):
+            return True
+        return self.kv_lora_rank is not None and self.qk_rope_head_dim is not None
 
     def _resolve_quantization_config(self) -> QuantizationConfig | None:
         """Resolve and unify quantization config from multiple sources.

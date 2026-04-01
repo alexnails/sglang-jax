@@ -306,7 +306,10 @@ class LogitsProcessor(nnx.Module):
         sampled_logits = logits[sample_indices] if sample_indices is not None else logits
 
         hidden_states_to_store: jax.Array | None = None
-        if logits_metadata.capture_hidden_mode.need_capture():
+        if (
+            logits_metadata.capture_hidden_mode is not None
+            and logits_metadata.capture_hidden_mode.need_capture()
+        ):
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None and len(aux_hidden_states) > 0:
                     hidden_states_to_store = jnp.concat(aux_hidden_states, axis=-1)

@@ -1061,101 +1061,204 @@ def update_fused_kv_cache_vectorized(
     return kv_cache
 
 
+@register_pytree_node_class
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
         size: int,
         page_size: int,
         dtype: jnp.dtype,
-        kv_lora_rank: int,
+        head_num: int,
+        qk_nope_head_dim: int,
         qk_rope_head_dim: int,
+        v_head_dim: int,
         layer_num: int,
         mesh: Mesh,
-        kv_partition_axis: str = "data",  # Note: ignored in MLA, no sharding applied
+        kv_partition_axis: str = "tensor",
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
-        self.kv_lora_rank = kv_lora_rank
+        self.head_num = head_num
+        self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
+        self.v_head_dim = v_head_dim
         self.kv_partition_axis = kv_partition_axis
+        self.is_mla = True
 
         self._create_buffers()
         self._calculate_memory_usage()
 
     def _create_buffers(self):
-        """Create KV buffers for MLA"""
-        # MLA sharding strategy - no sharding for MLA KV cache even with TP
-        self.kv_sharding = NamedSharding(self.mesh, P(None, None, None))
+        """Create KV buffers for MLA."""
+        self.kv_sharding = NamedSharding(self.mesh, P(None, self.kv_partition_axis, None))
+        self.rope_sharding = NamedSharding(self.mesh, P(None, None, None))
 
+        logger.info(
+            "[KVPool] %s: head_num=%s qk_nope_head_dim=%s qk_rope_head_dim=%s v_head_dim=%s "
+            "layer_num=%s size=%s page_size=%s",
+            type(self).__name__,
+            self.head_num,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
+            self.layer_num,
+            self.size,
+            self.page_size,
+        )
         with self.mesh:
-            # The padded slot 0 is used for writing dummy outputs from padded tokens
-            self.kv_buffer = []
+            self.k_nope_buffer = []
+            self.k_pe_buffer = []
+            self.v_buffer = []
             for _ in range(self.layer_num):
-                kv_buf = jnp.zeros(
-                    (
-                        self.size + self.page_size,
-                        1,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
+                k_nope_buf = jax.jit(
+                    lambda: jnp.zeros(
+                        (
+                            self.size + self.page_size,
+                            self.head_num,
+                            self.qk_nope_head_dim,
+                        ),
+                        dtype=self.dtype,
                     ),
-                    dtype=self.dtype,
-                )
-                kv_buf = jax.device_put(kv_buf, self.kv_sharding)
-                self.kv_buffer.append(kv_buf)
+                    out_shardings=self.kv_sharding,
+                )()
+                k_pe_buf = jax.jit(
+                    lambda: jnp.zeros(
+                        (
+                            self.size + self.page_size,
+                            1,
+                            self.qk_rope_head_dim,
+                        ),
+                        dtype=self.dtype,
+                    ),
+                    out_shardings=self.rope_sharding,
+                )()
+                v_buf = jax.jit(
+                    lambda: jnp.zeros(
+                        (
+                            self.size + self.page_size,
+                            self.head_num,
+                            self.v_head_dim,
+                        ),
+                        dtype=self.dtype,
+                    ),
+                    out_shardings=self.kv_sharding,
+                )()
+                self.k_nope_buffer.append(k_nope_buf)
+                self.k_pe_buffer.append(k_pe_buf)
+                self.v_buffer.append(v_buf)
+
+    def tree_flatten(self):
+        parent_children, parent_aux_data = KVCache.tree_flatten(self)
+        children = (self.k_nope_buffer, self.k_pe_buffer, self.v_buffer) + parent_children
+        aux_data = {
+            **parent_aux_data,
+            "head_num": self.head_num,
+            "qk_nope_head_dim": self.qk_nope_head_dim,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "v_head_dim": self.v_head_dim,
+            "kv_partition_axis": self.kv_partition_axis,
+            "kv_sharding": self.kv_sharding,
+            "rope_sharding": self.rope_sharding,
+            "is_mla": self.is_mla,
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = object.__new__(cls)
+
+        obj.size = aux_data["size"]
+        obj.page_size = aux_data["page_size"]
+        obj.dtype = aux_data["dtype"]
+        obj.layer_num = aux_data["layer_num"]
+        obj.mesh = aux_data["mesh"]
+        obj.start_layer = aux_data["start_layer"]
+        obj.end_layer = aux_data["end_layer"]
+        obj.mem_usage = aux_data["mem_usage"]
+
+        obj.head_num = aux_data["head_num"]
+        obj.qk_nope_head_dim = aux_data["qk_nope_head_dim"]
+        obj.qk_rope_head_dim = aux_data["qk_rope_head_dim"]
+        obj.v_head_dim = aux_data["v_head_dim"]
+        obj.kv_partition_axis = aux_data["kv_partition_axis"]
+        obj.kv_sharding = aux_data["kv_sharding"]
+        obj.rope_sharding = aux_data["rope_sharding"]
+        obj.is_mla = aux_data.get("is_mla", True)
+
+        obj.k_nope_buffer = children[0]
+        obj.k_pe_buffer = children[1]
+        obj.v_buffer = children[2]
+        return obj
 
     def _calculate_memory_usage(self):
-        """Calculate memory usage"""
-        kv_size = (
-            self.size
-            * (self.kv_lora_rank + self.qk_rope_head_dim)
-            * jnp.dtype(self.dtype).itemsize
-            * self.layer_num
-        )
-        self.mem_usage = kv_size / GB
+        """Calculate memory usage."""
+        k_size, v_size = self.get_kv_size_bytes()
+        self.mem_usage = (k_size + v_size) / GB
 
         logger.info(
             "JAX MLA KV Cache allocated. #tokens: %s, KV size: %.2f GB",
             self.size,
-            kv_size / GB,
+            (k_size + v_size) / GB,
         )
 
     def get_kv_size_bytes(self):
-        """Calculate KV cache size in bytes"""
-        kv_size = (
-            self.size
-            * (self.kv_lora_rank + self.qk_rope_head_dim)
+        """Calculate KV cache size in bytes."""
+        k_size = (
+            (self.size + self.page_size)
+            * (
+                self.head_num * self.qk_nope_head_dim
+                + self.qk_rope_head_dim
+            )
             * jnp.dtype(self.dtype).itemsize
             * self.layer_num
         )
-        return kv_size
+        v_size = (
+            (self.size + self.page_size)
+            * self.head_num
+            * self.v_head_dim
+            * jnp.dtype(self.dtype).itemsize
+            * self.layer_num
+        )
+        return k_size, v_size
 
     def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
-        """Get fused buffer for MLA architecture.
+        raise NotImplementedError("get_fused_kv_buffer is not supported for MLA KV cache")
 
-        Note: MLA has different architecture than standard MHA,
-        but we provide this interface for compatibility.
-        """
-        return self.kv_buffer[layer_id - self.start_layer]
+    def get_mla_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+        layer_idx = layer_id - self.start_layer
+        return (
+            self.k_nope_buffer[layer_idx],
+            self.k_pe_buffer[layer_idx],
+            self.v_buffer[layer_idx],
+        )
 
     def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
-        """Get separate K and V buffers for native attention from MLA KV cache.
+        return self.get_split_kv_buffer(layer_id)
 
-        Note: MLA architecture differs from standard MHA. For native attention compatibility,
-        we split the combined kv_lora_rank + qk_rope_head_dim into separate K and V components.
-
-        Returns:
-            Tuple of (k_buffer, v_buffer) where:
-            - k_buffer contains the kv_lora_rank portion
-            - v_buffer contains the qk_rope_head_dim portion
-        """
+    def get_split_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
         layer_idx = layer_id - self.start_layer
-        mla_kv = self.kv_buffer[layer_idx]  # [cache_size, 1, kv_lora_rank + qk_rope_head_dim]
-
-        # Split MLA KV buffer into K and V components for native attention
-        k_buffer = mla_kv[:, :, : self.kv_lora_rank]  # [cache_size, 1, kv_lora_rank]
-        v_buffer = mla_kv[:, :, self.kv_lora_rank :]  # [cache_size, 1, qk_rope_head_dim]
-
-        return k_buffer, v_buffer
+        k_nope = self.k_nope_buffer[layer_idx]
+        k_pe = self.k_pe_buffer[layer_idx]
+        k_pe_broadcast = jax.device_put(
+            jnp.broadcast_to(
+                k_pe,
+                (
+                    self.size + self.page_size,
+                    self.head_num,
+                    self.qk_rope_head_dim,
+                ),
+            ),
+            self.kv_sharding,
+        )
+        full_k = jnp.concatenate(
+            [
+                k_nope,
+                k_pe_broadcast,
+            ],
+            axis=-1,
+        )
+        return full_k, self.v_buffer[layer_idx]
 
     def set_kv_buffer(
         self,
@@ -1165,9 +1268,17 @@ class MLATokenToKVPool(KVCache):
         cache_v: jax.Array,
         is_decode: bool = False,
     ) -> None:
-        """Set KV cache data for MLA"""
-        layer_idx = layer_id - self.start_layer
-        self.kv_buffer[layer_idx] = self.kv_buffer[layer_idx].at[loc].set(cache_k)
+        """Set MLA KV cache from full K/V tensors."""
+        qk_nope = cache_k[..., : self.qk_nope_head_dim]
+        qk_rope = cache_k[..., self.qk_nope_head_dim :]
+        self.set_mla_kv_buffer(
+            layer_id,
+            loc,
+            qk_nope,
+            qk_rope[:, :1, :],
+            cache_v,
+            is_decode=is_decode,
+        )
 
     def set_mla_kv_buffer(
         self,
@@ -1175,24 +1286,82 @@ class MLATokenToKVPool(KVCache):
         loc: jax.Array,
         cache_k_nope: jax.Array,
         cache_k_rope: jax.Array,
+        cache_v: jax.Array,
+        is_decode: bool = False,
     ):
-        """Set MLA KV buffer with separate nope and rope components"""
+        """Set MLA KV buffer with separate nope/rope/value components."""
         layer_idx = layer_id - self.start_layer
-        # Concatenate nope and rope components
-        cache_k_combined = jnp.concatenate([cache_k_nope, cache_k_rope], axis=-1)
-        self.kv_buffer[layer_idx] = self.kv_buffer[layer_idx].at[loc].set(cache_k_combined)
+        page_size = 1 if is_decode else self.page_size
+
+        if self.mesh.devices.reshape(-1)[0].platform == "cpu":
+            cache_size = self.k_nope_buffer[layer_idx].shape[0]
+            safe_loc = jnp.where(loc >= 0, loc, jnp.int32(cache_size))
+            self.k_nope_buffer[layer_idx] = self.k_nope_buffer[layer_idx].at[safe_loc].set(
+                cache_k_nope,
+                mode="drop",
+            )
+            self.v_buffer[layer_idx] = self.v_buffer[layer_idx].at[safe_loc].set(
+                cache_v,
+                mode="drop",
+            )
+            self.k_pe_buffer[layer_idx] = self.k_pe_buffer[layer_idx].at[safe_loc].set(
+                cache_k_rope[:, :1, :],
+                mode="drop",
+            )
+            return
+
+        self.k_nope_buffer[layer_idx], self.v_buffer[layer_idx] = update_kv_cache_vectorized(
+            k=cache_k_nope,
+            v=cache_v,
+            loc=loc,
+            k_cache=self.k_nope_buffer[layer_idx],
+            v_cache=self.v_buffer[layer_idx],
+            page_size=page_size,
+            kv_partition_axis=self.kv_partition_axis,
+        )
+
+        rope_cache_size = self.k_pe_buffer[layer_idx].shape[0]
+        safe_loc = jnp.where(loc >= 0, loc, jnp.int32(rope_cache_size))
+        self.k_pe_buffer[layer_idx] = self.k_pe_buffer[layer_idx].at[safe_loc].set(
+            cache_k_rope[:, :1, :],
+            mode="drop",
+        )
+
+    def replace_kv_buffer(
+        self,
+        kv_buffer: list[tuple[jax.Array, jax.Array, jax.Array]],
+    ) -> None:
+        for i, (k_nope, k_pe, v) in enumerate(kv_buffer):
+            self.k_nope_buffer[i] = k_nope
+            self.k_pe_buffer[i] = k_pe
+            self.v_buffer[i] = v
 
     def get_cpu_copy(self, indices):
-        """Get CPU copy of KV cache for specified indices"""
+        """Get CPU copy of KV cache for specified indices."""
         kv_cache_host = []
         for layer_id in range(self.layer_num):
-            kv_host = jax.device_get(self.kv_buffer[layer_id][indices])
-            kv_cache_host.append(kv_host)
+            kv_cache_host.append(
+                [
+                    jax.device_get(self.k_nope_buffer[layer_id][indices]),
+                    jax.device_get(self.k_pe_buffer[layer_id][indices]),
+                    jax.device_get(self.v_buffer[layer_id][indices]),
+                ]
+            )
         return kv_cache_host
 
     def load_cpu_copy(self, kv_cache_host, indices):
-        """Load host copy back to device"""
+        """Load host copy back to device."""
         for layer_id in range(self.layer_num):
-            kv_host = kv_cache_host[layer_id]
-            kv_device = jax.device_put(kv_host, self.kv_sharding)
-            self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(kv_device)
+            k_nope_host, k_pe_host, v_host = kv_cache_host[layer_id]
+            k_nope_device = jax.device_put(k_nope_host, self.kv_sharding)
+            k_pe_device = jax.device_put(k_pe_host, self.rope_sharding)
+            v_device = jax.device_put(v_host, self.kv_sharding)
+            self.k_nope_buffer[layer_id] = self.k_nope_buffer[layer_id].at[indices].set(k_nope_device)
+            self.k_pe_buffer[layer_id] = self.k_pe_buffer[layer_id].at[indices].set(k_pe_device)
+            self.v_buffer[layer_id] = self.v_buffer[layer_id].at[indices].set(v_device)
+
+    def clear_cache(self, indices: jax.Array):
+        for layer_id in range(self.layer_num):
+            self.k_nope_buffer[layer_id] = self.k_nope_buffer[layer_id].at[indices].set(0)
+            self.k_pe_buffer[layer_id] = self.k_pe_buffer[layer_id].at[indices].set(0)
+            self.v_buffer[layer_id] = self.v_buffer[layer_id].at[indices].set(0)
